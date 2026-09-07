@@ -67,3 +67,6 @@ scripts/rac/cspaper_blind/
 
 # Consolidated experiment analysis (working notes, not part of the library)
 scripts/rac/analysis/
+
+# Reviewer output on the batch (contains full review text; keep local)
+scripts/rac/judgements/
