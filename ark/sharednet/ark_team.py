@@ -27,6 +27,7 @@ from __future__ import annotations
 
 import os
 from datetime import datetime
+import pathlib
 from typing import Optional
 
 import yaml
@@ -92,11 +93,13 @@ class ArkRoomTeam:
             member_prefix=str(settings.get("member_prefix") or ""),
             task_builder=self.task_for,
             done_guard=self.done_guard,
+            salvage=self.salvage_handoff,
             max_hops=int(settings.get("max_hops", 12)),
             steer_wait_seconds=int(settings.get("steer_wait_seconds", 0)),
             log=lambda line: orch.log(line, "INFO"),
         )
         self.last_score: Optional[float] = None
+        self._pre_hop_disk: dict = {}
 
     # ── Goal / start ─────────────────────────────────────────────────────────
     def goal(self) -> str:
@@ -120,6 +123,7 @@ class ArkRoomTeam:
 
     # ── run_agent with ARK's timeouts and score bookkeeping ─────────────────
     def run_agent(self, role: str, task: str) -> str:
+        self._pre_hop_disk = self._disk_snapshot()
         if role in FIGURE_CONSUMING_ROLES:
             self._refresh_figures(role)
         output = self.orch.run_agent(role, task, timeout=TIMEOUTS.get(role, 1800))
@@ -176,6 +180,89 @@ class ArkRoomTeam:
             return False
         score = self.orch.parse_review_score(output)
         return score >= self.orch.paper_accept_threshold
+
+    # ── Recovering a hand-off the timeout killed ────────────────────────────
+    # Directories worth diffing: everything an Agent writes into. `.conda_env`
+    # and `sandbox/pydeps` are excluded because a pip install there is hundreds
+    # of files and says nothing about the paper.
+    SALVAGE_DIRS: tuple[str, ...] = ("paper", "auto_research/state", "results", "code")
+    SALVAGE_MAX_FILES = 40
+    SALVAGE_TIMEOUT = 120
+
+    def _disk_snapshot(self) -> dict:
+        """(path → mtime, size) for the files an Agent could have written."""
+        root = self.orch.project_dir if hasattr(self.orch, "project_dir") else pathlib.Path(".")
+        snapshot: dict = {}
+        for relative in self.SALVAGE_DIRS:
+            base = pathlib.Path(root) / relative
+            if not base.is_dir():
+                continue
+            for path in base.rglob("*"):
+                if path.is_file() and ".conda_env" not in path.parts and "pydeps" not in path.parts:
+                    try:
+                        stat = path.stat()
+                    except OSError:
+                        continue
+                    snapshot[str(path)] = (stat.st_mtime, stat.st_size)
+        return snapshot
+
+    @staticmethod
+    def _changed(before: dict, after: dict) -> list[str]:
+        changes = []
+        for path, value in after.items():
+            was = before.get(path)
+            if was is None:
+                changes.append(f"created {path}")
+            elif was != value:
+                delta = value[1] - was[1]
+                changes.append(f"modified {path} ({delta:+d} bytes)")
+        return sorted(changes)
+
+    def salvage_handoff(self, role: str, task: str, output: str):
+        """Recover the routing decision when the Agent left none.
+
+        A wall-clock timeout kills the Agent after its work has reached disk:
+        the run keeps the files and loses only the sentence saying who should
+        work next. Falling straight back to the fixed successor table throws
+        away the one thing the Room exists to collect, so this asks a single
+        short question about the state the Agent left behind. It does not redo
+        the work and it does not read the task's full context — and the caller
+        records the answer as ``decided_by=salvage``, so it is never counted as
+        a clean Agent decision.
+        """
+        from ark import llm_lite
+        from .typed import handoff_instruction, parse_handoff
+
+        changes = self._changed(self._pre_hop_disk, self._disk_snapshot())
+        if not changes and not (output or "").strip():
+            self.orch.log(f"[room] {role}: nothing on disk changed; no hand-off to salvage", "WARN")
+            return None
+        shown = changes[:self.SALVAGE_MAX_FILES]
+        elided = len(changes) - len(shown)
+        listing = "\n".join(f"- {line}" for line in shown) + (
+            f"\n- … and {elided} more file(s)" if elided > 0 else "")
+        prompt = (
+            f"You are the {role} on an AI-research team. Your run was cut short by a "
+            f"wall-clock timeout before you could state who should work next, but the "
+            f"work you had already done is on disk.\n\n"
+            f"## What you were asked to do\n{task[:2000]}\n\n"
+            f"## What changed on disk during your run\n{listing or '(nothing)'}\n\n"
+            f"## The last thing you said, if anything\n{(output or '').strip()[-1500:] or '(nothing)'}\n\n"
+            f"Judge only from the evidence above: given what got done and what did not, "
+            f"who should work next?\n\n{handoff_instruction(tuple(self.team.roles))}\n\n"
+            f"Reply with the HANDOFF line and nothing else."
+        )
+        model = self.orch.config.get("model") or llm_lite.utility_model()
+        text = llm_lite.complete(prompt, model=model, max_tokens=300,
+                                 timeout=self.SALVAGE_TIMEOUT)
+        handoff = parse_handoff(text)
+        if handoff is None:
+            self.orch.log(f"[room] {role}: salvage produced no usable hand-off", "WARN")
+            return None
+        self.orch.log(
+            f"[room] {role}: hand-off salvaged from {len(changes)} disk change(s) → "
+            f"{handoff.next or 'done'} ({handoff.reason[:80]})", "INFO")
+        return handoff
 
     # ── Tasks per role, from the shared state files ─────────────────────────
     def task_for(self, context: HopContext) -> str:
