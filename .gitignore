@@ -61,3 +61,12 @@ scripts/rac/room_logs/
 
 # PaperBanana smoke-test output
 scripts/rac/probe_out/
+
+# Blinded PDF copies for external review submission
+scripts/rac/cspaper_blind/
+
+# Consolidated experiment analysis (working notes, not part of the library)
+scripts/rac/analysis/
+
+# Reviewer output on the batch (contains full review text; keep local)
+scripts/rac/judgements/

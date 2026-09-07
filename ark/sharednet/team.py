@@ -56,6 +56,9 @@ DEFAULT_SUCCESSOR: dict[str, str] = {
 RunAgent = Callable[[str, str], str]
 TaskBuilder = Callable[["HopContext"], str]
 DoneGuard = Callable[[str, str], Optional[bool]]
+# Called only when an Agent left no usable hand-off: (role, task, output) →
+# a decision recovered from what the Agent left behind, or None.
+Salvage = Callable[[str, str, str], Optional["Handoff"]]
 Log = Callable[[str], None]
 
 SUMMARY_HEAD = 5000
@@ -143,6 +146,7 @@ class RoomTeam:
         successor: Optional[dict[str, str]] = None,
         task_builder: TaskBuilder = default_task_builder,
         done_guard: Optional[DoneGuard] = None,
+        salvage: Optional[Salvage] = None,
         max_hops: int = 12,
         max_consecutive_same_role: int = 2,
         steer_wait_seconds: int = 0,
@@ -161,6 +165,7 @@ class RoomTeam:
         self.successor = dict(successor or DEFAULT_SUCCESSOR)
         self.task_builder = task_builder
         self.done_guard = done_guard
+        self.salvage = salvage
         self.max_hops = max_hops
         self.max_consecutive_same_role = max_consecutive_same_role
         self.steer_wait_seconds = steer_wait_seconds
@@ -266,7 +271,20 @@ class RoomTeam:
 
             output = self.run_agent(role, f"{task}\n\n{handoff_instruction(self.roles)}")
             handoff = parse_handoff(output)
-            decision = self._decide(role, handoff, output, consecutive)
+            # A wall-clock timeout kills the Agent after its work has reached
+            # disk, so the run keeps the work and loses only the routing
+            # judgement. Rather than hand that judgement straight to the fixed
+            # table, ask once about the state the Agent left behind. The answer
+            # is recorded as decided_by=salvage, never as a clean Agent decision.
+            salvaged = False
+            if handoff is None and self.salvage is not None:
+                try:
+                    handoff = self.salvage(role, task, output)
+                except Exception as error:  # a failed salvage must not end the run
+                    self.log(f"[room] {role}: hand-off salvage failed: {error}")
+                    handoff = None
+                salvaged = handoff is not None
+            decision = self._decide(role, handoff, output, consecutive, salvaged)
 
             result_fields = {"next": decision.next, "done": decision.done, "reason": decision.reason,
                              "decided_by": decision.decided_by, "hop": hop}
@@ -303,7 +321,8 @@ class RoomTeam:
         return TeamResult(done=False, reason=reason, hops=hops)
 
     # ── Routing policy ──────────────────────────────────────────────────────
-    def _decide(self, role: str, handoff: Optional[Handoff], output: str, consecutive: int) -> Decision:
+    def _decide(self, role: str, handoff: Optional[Handoff], output: str, consecutive: int,
+                salvaged: bool = False) -> Decision:
         fallback = self.successor.get(role) or self.roles[0]
         if handoff is None:
             # Two different failures land here and they mean opposite things: an
@@ -327,7 +346,7 @@ class RoomTeam:
                                 reason=f"agent said done but the guard disagrees; {handoff.reason}".strip("; "),
                                 decided_by="policy")
             return Decision(next=None, done=True, reason=handoff.reason or "agent declared done",
-                            decided_by="agent")
+                            decided_by="salvage" if salvaged else "agent")
         if handoff.next not in self.roles:
             return Decision(next=fallback, done=False,
                             reason=f"asked for {handoff.next!r}, not a team role; policy successor",
@@ -336,7 +355,8 @@ class RoomTeam:
             return Decision(next=fallback, done=False,
                             reason=f"{role} has run {consecutive} hops in a row and asked for itself again; policy successor",
                             decided_by="policy")
-        return Decision(next=handoff.next, done=False, reason=handoff.reason, decided_by="agent")
+        return Decision(next=handoff.next, done=False, reason=handoff.reason,
+                        decided_by="salvage" if salvaged else "agent")
 
     # ── Group chat: what others said between hops ───────────────────────────
     def _collect_guidance(self) -> list[RoomMessage]:

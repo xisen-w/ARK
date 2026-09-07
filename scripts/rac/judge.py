@@ -33,9 +33,18 @@ import urllib.request
 import yaml
 
 ARK_ROOT = pathlib.Path(__file__).resolve().parents[2]
-MODEL = "claude-sonnet-4-6"
 MAX_PAPER_CHARS = 120_000          # ~30k tokens; the papers here run 11-12 pages
-API = "https://api.anthropic.com/v1/messages"
+
+# The same model reachable two ways. Anthropic-direct is the default; the
+# OpenRouter route exists because the Anthropic balance ran out mid-batch and a
+# judgement is worthless if half the papers cannot be scored by the same judge.
+BACKENDS = {
+    "anthropic": {"url": "https://api.anthropic.com/v1/messages",
+                  "model": "claude-sonnet-4-6"},
+    "openrouter": {"url": "https://openrouter.ai/api/v1/chat/completions",
+                   "model": "anthropic/claude-sonnet-4.6"},
+}
+BACKEND = "anthropic"              # set by --backend
 
 
 # ── PDF text ────────────────────────────────────────────────────────────────
@@ -58,22 +67,34 @@ def pdf_text(path: pathlib.Path) -> str:
 # ── Anthropic ───────────────────────────────────────────────────────────────
 def api_key() -> str:
     cfg = yaml.safe_load((ARK_ROOT / ".ark/config.yaml").read_text())
-    return cfg["anthropic_api_key"]
+    return cfg["anthropic_api_key" if BACKEND == "anthropic" else "openrouter_api_key"]
 
 
 def ask(system: str, user: str, key: str, max_tokens: int = 8000,
         retries: int = 3) -> tuple[str, dict]:
-    body = {"model": MODEL, "max_tokens": max_tokens, "system": system,
-            "messages": [{"role": "user", "content": user}]}
+    """One completion, from whichever backend is selected."""
+    backend = BACKENDS[BACKEND]
+    if BACKEND == "anthropic":
+        body = {"model": backend["model"], "max_tokens": max_tokens,
+                "system": system, "messages": [{"role": "user", "content": user}]}
+        headers = {"x-api-key": key, "anthropic-version": "2023-06-01",
+                   "content-type": "application/json"}
+    else:
+        body = {"model": backend["model"], "max_tokens": max_tokens,
+                "messages": [{"role": "system", "content": system},
+                             {"role": "user", "content": user}]}
+        headers = {"authorization": f"Bearer {key}",
+                   "content-type": "application/json"}
     for attempt in range(retries):
-        req = urllib.request.Request(
-            API, data=json.dumps(body).encode(),
-            headers={"x-api-key": key, "anthropic-version": "2023-06-01",
-                     "content-type": "application/json"})
+        req = urllib.request.Request(backend["url"], data=json.dumps(body).encode(),
+                                     headers=headers)
         try:
             with urllib.request.urlopen(req, timeout=600) as response:
                 payload = json.loads(response.read())
-            return payload["content"][0]["text"], payload.get("usage", {})
+            if BACKEND == "anthropic":
+                return payload["content"][0]["text"], payload.get("usage", {})
+            return (payload["choices"][0]["message"]["content"],
+                    payload.get("usage", {}))
         except urllib.error.HTTPError as error:
             detail = error.read().decode()[:200]
             if attempt == retries - 1:
@@ -217,7 +238,11 @@ def main() -> int:
                         help="PDF to judge; repeatable, paired with --label")
     parser.add_argument("--label", action="append", default=[])
     parser.add_argument("--out", default=str(ARK_ROOT / "scripts/rac/judgements"))
+    parser.add_argument("--backend", choices=sorted(BACKENDS), default="anthropic")
     args = parser.parse_args()
+    global BACKEND
+    BACKEND = args.backend
+    print(f"backend {BACKEND}: {BACKENDS[BACKEND]['model']}")
     if len(args.pdf) != len(args.label):
         print("error: one --label per --pdf", file=sys.stderr)
         return 1

@@ -220,3 +220,60 @@ def test_members_are_distinct_room_members(fake):
     assert names == sorted(["ark-orchestrator", *ROLES])
     assert len(team.member_ids) == len(ROLES) + 1
     assert all(isinstance(c, RoomClient) and c.member_id for c in team.members.values())
+
+
+# ── Salvaging a hand-off the timeout killed ─────────────────────────────────
+def test_salvage_recovers_the_route_when_the_agent_left_nothing(fake):
+    """A timeout kills the Agent after its work reached disk, so the routing
+    judgement is recovered from that work rather than handed to the table."""
+    run_agent = scripted({
+        "experimenter": [""],                       # killed at the wall clock
+        "writer": [f"drafted\n{handoff('reviewer')}"],
+        "reviewer": [f"Overall Score: 9/10\n{handoff(None, done=True, reason='ship it')}"],
+    })
+    calls = []
+
+    def salvage(role, task, output):
+        calls.append((role, output))
+        from ark.sharednet.typed import Handoff
+        return Handoff(next="writer", done=False, reason="results are on disk")
+
+    team = make_team(fake, run_agent, salvage=salvage)
+    result = team.run("goal", start_role="experimenter")
+    assert result.route == ["experimenter", "writer", "reviewer"]
+    assert calls == [("experimenter", "")]          # asked once, only for the empty hop
+    decisions = [d for _, kind, d, _ in typed_transcript(fake) if kind == WORK_RESULT]
+    assert decisions[0]["decided_by"] == "salvage"
+    assert decisions[0]["next"] == "writer"
+    assert decisions[0]["reason"] == "results are on disk"
+    assert decisions[1]["decided_by"] == "agent"    # a normal hop is untouched
+
+
+def test_salvage_is_not_consulted_when_the_agent_stated_its_decision(fake):
+    run_agent = scripted({"experimenter": [f"done\n{handoff('writer')}"]})
+    calls = []
+    team = make_team(fake, run_agent,
+                     salvage=lambda *a: calls.append(a) or None, max_hops=1)
+    team.run("goal", start_role="experimenter")
+    assert calls == []
+
+
+def test_policy_still_takes_over_when_salvage_finds_nothing(fake):
+    run_agent = scripted({"experimenter": [""]})
+    team = make_team(fake, run_agent, salvage=lambda *a: None, max_hops=1)
+    team.run("goal", start_role="experimenter")
+    decision = [d for _, kind, d, _ in typed_transcript(fake) if kind == WORK_RESULT][0]
+    assert decision["decided_by"] == "policy"
+    assert "no output" in decision["reason"]
+
+
+def test_a_failing_salvage_does_not_end_the_run(fake):
+    def explode(role, task, output):
+        raise RuntimeError("salvage backend down")
+
+    run_agent = scripted({"experimenter": [""]})
+    team = make_team(fake, run_agent, salvage=explode, max_hops=1)
+    result = team.run("goal", start_role="experimenter")
+    assert result.route == ["experimenter"]
+    decision = [d for _, kind, d, _ in typed_transcript(fake) if kind == WORK_RESULT][0]
+    assert decision["decided_by"] == "policy"
